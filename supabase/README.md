@@ -13,10 +13,11 @@ For a new project, run the complete `setup.sql` script as above. For an existing
 
 1. `migrations/20261126_lobby_game_updates.sql` (only if the project has not already applied it).
 2. `migrations/20261126_room_visibility_and_host_selection.sql` (only if the project has not already applied it).
-3. `migrations/20261127_gameplay_voting_and_roles.sql`.
+3. `migrations/20261127_gameplay_voting_and_roles.sql` (only if the project has not already applied it).
+4. `migrations/20261128_gizmo_gameplay_and_narration.sql`.
 
-The new migration is transactional and safe to rerun. It adds the configurable voting clock, one-to-four-round setting, private human-moderator word setup, server-checked secret-word filtering, spy confession, timed voting, and the revised start/turn rules. After the migration succeeds, publish the updated `app.js`; keep `index.html` and the existing assets with the site. Do not publish the website before running the migration, because the updated client calls the new RPCs.
+The gameplay migrations are transactional and safe to rerun. The newest migration adds the in-game moderator setup phase, timeout fallback, retained round chat, timeout silence messages, all-player confession, and the seven-second inter-round break. Apply it after the earlier gameplay migration and before publishing the updated `app.js`.
 
 Disconnected players are removed after 90 seconds without a server heartbeat; another connected room member runs the cleanup. If too few active players remain during a game, the game ends without a winner. When the owner leaves, ownership transfers to the earliest remaining human player; if none remain, the room is deleted.
 
-The earlier visibility migration preserves existing room visibility values (only the default for new rooms changes). The gameplay migration does not change application keys. Deploy the updated `app.js` alongside the existing `index.html` and assets after the SQL migration succeeds.
+The earlier visibility migration preserves existing room visibility values (only the default for new rooms changes). The gameplay migrations do not change application keys. Deploy the updated `app.js` alongside the existing `index.html` and assets after the SQL migration succeeds.
