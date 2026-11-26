@@ -212,7 +212,7 @@ begin
   if s.host_mode='owner' then v_moderator:=r.owner_uid;
   elsif s.host_mode='random' then select user_id into v_moderator from public.room_players where room_id=p_room and not is_bot order by random() limit 1;
   else v_moderator:=null; end if;
-  update public.room_players set is_moderator=(user_id=v_moderator),is_eliminated=false where room_id=p_room;
+  update public.room_players set is_moderator=coalesce(user_id=v_moderator,false),is_eliminated=false where room_id=p_room;
   select array_agg(id order by joined_at) into v_order from public.room_players where room_id=p_room and not is_moderator;
   if coalesce(array_length(v_order,1),0)<3 then raise exception 'Not enough active players'; end if;
   select id into v_spy from public.room_players where id=any(v_order) and not is_bot order by random() limit 1;
@@ -239,7 +239,7 @@ declare r public.rooms%rowtype; s public.room_settings%rowtype; v_next integer; 
 begin
   select * into r from public.rooms where id=p_room for update;
   if r.status<>'playing' or r.phase<>'clue' then return; end if;
-  if not p_timeout and not public.is_room_owner(p_room) and not exists(select 1 from public.room_players where id=r.current_player_id and user_id=auth.uid()) then raise exception 'Not your turn'; end if;
+  if not p_timeout and not public.is_room_owner(p_room) and not exists(select 1 from public.room_players where id=r.current_player_id and (user_id=auth.uid() or is_bot) and public.is_room_member(p_room)) then raise exception 'Not your turn'; end if;
   if p_timeout and r.turn_ends_at>now() then raise exception 'Turn has not ended'; end if;
   v_next:=r.turn_pos+1; v_len:=coalesce(array_length(r.turn_order,1),0);
   if v_next<=v_len then
@@ -300,6 +300,7 @@ create or replace function public.run_bot_turn(p_room uuid) returns void
 language plpgsql security definer set search_path=public,auth,pg_temp as $$
 declare r public.rooms%rowtype; p public.room_players%rowtype; s public.room_settings%rowtype; v_text text;
 begin
+  if not public.is_room_member(p_room) then raise exception 'Join the room first'; end if;
   select * into r from public.rooms where id=p_room for update;
   select * into p from public.room_players where id=r.current_player_id and is_bot;
   if not found or r.phase<>'clue' then raise exception 'Bot is not up'; end if;
