@@ -8,3 +8,5 @@ This schema must be installed before the website can create shared rooms.
 4. Do not use or publish a `secret` or `service_role` key in the browser app.
 
 The `publishable` key is intended for browser clients. Row-level security in this schema keeps room settings private before a game and hides each player's word and role from other players.
+
+If you already installed the schema, run the latest complete setup.sql again in the Supabase SQL Editor after updates. The script is designed to be rerun safely.
