@@ -5,7 +5,7 @@ create table if not exists public.rooms (
   code text not null unique check (code ~ '^[0-9]{5}$'),
   owner_uid uuid not null references auth.users(id) on delete cascade,
   owner_name text not null,
-  is_public boolean not null default true,
+  is_public boolean not null default false,
   status text not null default 'lobby' check (status in ('lobby','playing','finished')),
   phase text not null default 'setup' check (phase in ('setup','countdown','clue','voting','results')),
   player_count integer not null default 0,
@@ -22,7 +22,7 @@ create table if not exists public.rooms (
 create table if not exists public.room_settings (
   room_id uuid primary key references public.rooms(id) on delete cascade,
   max_players integer not null default 6 check (max_players between 4 and 8),
-  host_mode text not null default 'bot' check (host_mode in ('player','bot')),
+  host_mode text not null default 'random' check (host_mode in ('player','bot','random')),
   moderator_player_id uuid,
   game_mode text not null default 'chat' check (game_mode in ('chat','live')),
   turn_seconds integer not null default 60 check (turn_seconds between 15 and 60),
@@ -61,25 +61,22 @@ create table if not exists public.room_exit_notices (
 );
 alter table public.room_players add column if not exists avatar text;
 alter table public.room_settings add column if not exists moderator_player_id uuid;
+alter table public.rooms alter column is_public set default false;
 alter table public.room_settings alter column turn_seconds set default 60;
 alter table public.room_settings drop constraint if exists room_settings_host_mode_check;
 update public.room_settings set moderator_player_id=(
   select p.id from public.room_players p join public.rooms r on r.id=p.room_id
   where p.room_id=room_settings.room_id and p.user_id=r.owner_uid
 ) where host_mode='owner';
-update public.room_settings set moderator_player_id=(
-  select p.id from public.room_players p
-  where p.room_id=room_settings.room_id and not p.is_bot
-  order by p.joined_at limit 1
-) where host_mode='random';
-update public.room_settings set host_mode='player' where host_mode in ('owner','random');
-update public.room_settings set host_mode='bot',moderator_player_id=null where host_mode not in ('player','bot');
-update public.room_settings s set host_mode='player',moderator_player_id=(
-  select p.id from public.room_players p join public.rooms r on r.id=p.room_id
-  where p.room_id=s.room_id and p.user_id=r.owner_uid
-) from public.rooms r where r.id=s.room_id and r.player_count>3 and s.host_mode='bot';
-alter table public.room_settings alter column host_mode set default 'bot';
-alter table public.room_settings add constraint room_settings_host_mode_check check (host_mode in ('player','bot'));
+update public.room_settings set moderator_player_id=null where host_mode='random';
+update public.room_settings set host_mode='player' where host_mode='owner';
+update public.room_settings set host_mode='bot',moderator_player_id=null where host_mode not in ('player','bot','random');
+update public.room_settings s set host_mode='bot',moderator_player_id=null
+from public.rooms r
+where r.id=s.room_id and r.status='lobby'
+  and (select count(*) from public.room_players p where p.room_id=r.id and not p.is_bot)<=3;
+alter table public.room_settings alter column host_mode set default 'random';
+alter table public.room_settings add constraint room_settings_host_mode_check check (host_mode in ('player','bot','random'));
 do $$ begin
   if not exists(select 1 from pg_constraint where conname='room_players_avatar_check' and conrelid='public.room_players'::regclass) then
     alter table public.room_players add constraint room_players_avatar_check check (avatar is null or (char_length(avatar)<=40000 and avatar like 'data:image/webp;base64,%'));
@@ -211,10 +208,10 @@ begin
   if p_avatar is not null and (char_length(p_avatar)>40000 or p_avatar not like 'data:image/webp;base64,%') then raise exception 'Invalid avatar'; end if;
   loop
     v_code:=lpad(floor(random()*100000)::int::text,5,'0');
-    insert into public.rooms(code,owner_uid,owner_name) values(v_code,auth.uid(),v_name) on conflict(code) do nothing returning id into v_room;
+    insert into public.rooms(code,owner_uid,owner_name,is_public) values(v_code,auth.uid(),v_name,false) on conflict(code) do nothing returning id into v_room;
     exit when v_room is not null;
   end loop;
-  insert into public.room_settings(room_id,max_players,host_mode,game_mode,turn_seconds,vote_after_rounds) values(v_room,6,'bot','chat',60,3);
+  insert into public.room_settings(room_id,max_players,host_mode,game_mode,turn_seconds,vote_after_rounds) values(v_room,6,'random','chat',60,3);
   insert into public.room_players(room_id,user_id,nickname,avatar,is_ready) values(v_room,auth.uid(),v_name,p_avatar,false) returning id into v_player;
   insert into public.room_presence(player_id,room_id,user_id,last_seen_at) values(v_player,v_room,auth.uid(),now());
   return jsonb_build_object('id',v_room,'code',v_code);
@@ -245,51 +242,52 @@ begin
   insert into public.room_players(room_id,user_id,nickname,avatar) values(r.id,auth.uid(),v_name,p_avatar) returning id into v_player;
   insert into public.room_presence(player_id,room_id,user_id,last_seen_at) values(v_player,r.id,auth.uid(),now());
   delete from public.room_exit_notices where room_id=r.id and user_id=auth.uid();
-  if r.player_count+1>3 then
-    update public.room_settings set host_mode='player',moderator_player_id=(
-      select p.id from public.room_players p where p.room_id=r.id and p.user_id=r.owner_uid
-    ) where room_id=r.id and host_mode='bot';
-  end if;
   return r.id;
 end $$;
 
 drop function if exists public.update_room_settings(uuid,integer,text,text,integer,integer);
 create or replace function public.update_room_settings(p_room uuid,p_max integer,p_host text,p_moderator uuid,p_mode text,p_seconds integer,p_vote_rounds integer) returns void
 language plpgsql security definer set search_path=public,auth,pg_temp as $$
-declare v_count integer; v_all_ready boolean;
+declare v_humans integer; v_all_ready boolean;
 begin
   perform 1 from public.rooms where id=p_room and owner_uid=auth.uid() and status='lobby' for update;
   if not found then raise exception 'Only the room owner can change settings in a lobby'; end if;
-  if p_max not between 4 and 8 or p_host not in ('player','bot') or p_mode not in ('chat','live') or p_seconds not between 15 and 60 or p_vote_rounds not between 2 and 4 then raise exception 'Invalid settings'; end if;
+  if p_max not between 4 and 8 or p_host not in ('player','bot','random') or p_mode not in ('chat','live') or p_seconds not between 15 and 60 or p_vote_rounds not between 2 and 4 then raise exception 'Invalid settings'; end if;
   if (select player_count from public.rooms where id=p_room)>p_max then raise exception 'Remove players before lowering the limit'; end if;
-  select player_count into v_count from public.rooms where id=p_room;
-  if v_count<=3 then p_host:='bot'; p_moderator:=null;
-  elsif p_host<>'player' or not exists(select 1 from public.room_players where id=p_moderator and room_id=p_room and not is_bot) then raise exception 'Choose a player to lead the game';
+  select count(*) into v_humans from public.room_players where room_id=p_room and not is_bot;
+  if v_humans<=3 then p_host:='bot'; p_moderator:=null;
+  elsif p_host='player' and not exists(select 1 from public.room_players where id=p_moderator and room_id=p_room and not is_bot) then raise exception 'Choose a player to lead the game';
+  elsif p_host in ('bot','random') then p_moderator:=null;
   end if;
   update public.room_settings set max_players=p_max,host_mode=p_host,moderator_player_id=p_moderator,game_mode=p_mode,turn_seconds=p_seconds,vote_after_rounds=p_vote_rounds where room_id=p_room;
   select not exists(select 1 from public.room_players where room_id=p_room and not is_bot and not is_ready) into v_all_ready;
-  if v_all_ready and ((p_host='bot' and v_count>=3) or (p_host='player' and v_count>=4)) then
-    perform public._start_game(p_room);
-  end if;
+  if v_all_ready then perform public._start_game(p_room); end if;
+end $$;
+
+create or replace function public.set_room_visibility(p_room uuid,p_is_public boolean) returns void
+language plpgsql security definer set search_path=public,auth,pg_temp as $$
+begin
+  update public.rooms set is_public=p_is_public
+  where id=p_room and owner_uid=auth.uid() and status='lobby';
+  if not found then raise exception 'Only the room owner can change visibility in a lobby'; end if;
 end $$;
 
 create or replace function public.set_ready(p_room uuid,p_ready boolean) returns void
 language plpgsql security definer set search_path=public,auth,pg_temp as $$
-declare v_count integer; v_all_ready boolean;
+declare v_all_ready boolean;
 begin
   perform 1 from public.rooms where id=p_room and status='lobby' for update;
   if not found then raise exception 'Room is not accepting ready status'; end if;
   update public.room_players set is_ready=p_ready where room_id=p_room and user_id=auth.uid() and exists(select 1 from public.rooms r where r.id=p_room and r.status='lobby');
   if not found then raise exception 'Cannot update ready status'; end if;
-  select player_count into v_count from public.rooms where id=p_room;
   select not exists(select 1 from public.room_players where room_id=p_room and not is_bot and not is_ready) into v_all_ready;
-  if v_count>=3 and v_all_ready then perform public._start_game(p_room); end if;
+  if v_all_ready then perform public._start_game(p_room); end if;
 end $$;
 
 create or replace function public._remove_room_player(p_room uuid,p_player uuid,p_reason text) returns boolean
 language plpgsql security definer set search_path=public,auth,pg_temp as $$
 declare r public.rooms%rowtype; p public.room_players%rowtype; v_new_owner uuid; v_new_owner_name text; v_new_owner_player uuid;
-  v_order uuid[]; v_position integer; v_active integer; v_humans integer; v_current_exists boolean;
+  v_order uuid[]; v_position integer; v_active integer; v_humans integer; v_live_humans integer; v_current_exists boolean;
 begin
   if p_reason not in ('owner','offline','leave') then raise exception 'Invalid removal reason'; end if;
   select * into r from public.rooms where id=p_room for update;
@@ -319,9 +317,10 @@ begin
     select id into v_new_owner_player from public.room_players where room_id=p_room and user_id=v_new_owner;
   end if;
 
+  select count(*) into v_live_humans from public.room_players where room_id=p_room and not is_bot;
   update public.room_settings s set
-    host_mode=case when (select player_count from public.rooms where id=p_room)<=3 then 'bot' else 'player' end,
-    moderator_player_id=case when (select player_count from public.rooms where id=p_room)<=3 then null else v_new_owner_player end
+    host_mode=case when v_live_humans<=3 then 'bot' else 'random' end,
+    moderator_player_id=null
   where s.room_id=p_room and s.moderator_player_id=p_player;
 
   if r.status<>'playing' then return true; end if;
@@ -424,12 +423,6 @@ begin
   select count(*)+1 into v_number from public.room_players where room_id=p_room and is_bot;
   v_name:=public._unique_room_nickname(p_room,'Бот '||v_number);
   insert into public.room_players(room_id,nickname,is_bot,is_ready) values(p_room,v_name,true,true) returning id into v_id;
-  if (select player_count from public.rooms where id=p_room)>3 then
-    update public.room_settings set host_mode='player',moderator_player_id=(
-      select p.id from public.room_players p join public.rooms r on r.id=p.room_id
-      where p.room_id=p_room and p.user_id=r.owner_uid
-    ) where room_id=p_room and host_mode='bot';
-  end if;
   if (select player_count from public.rooms where id=p_room)>=3 and not exists(select 1 from public.room_players where room_id=p_room and not is_bot and not is_ready) then perform public._start_game(p_room); end if;
   return v_id;
 end $$;
@@ -452,22 +445,27 @@ end $$;
 
 create or replace function public._start_game(p_room uuid) returns void
 language plpgsql security definer set search_path=public,auth,pg_temp as $$
-declare r public.rooms%rowtype; s public.room_settings%rowtype; v_count integer; v_moderator uuid; v_order uuid[]; v_spy uuid; v_pair text[]; p record;
+declare r public.rooms%rowtype; s public.room_settings%rowtype; v_humans integer; v_active integer; v_active_humans integer; v_moderator_player uuid; v_moderator uuid; v_order uuid[]; v_spy uuid; v_pair text[]; p record;
 begin
   select * into r from public.rooms where id=p_room for update;
   if not found or r.status<>'lobby' then return; end if;
   select * into s from public.room_settings where room_id=p_room;
-  select count(*) into v_count from public.room_players where room_id=p_room;
+  select count(*) into v_humans from public.room_players where room_id=p_room and not is_bot;
   if exists(select 1 from public.room_players where room_id=p_room and not is_bot and not is_ready) then return; end if;
-  if v_count<=3 then
-    v_moderator:=null;
+  if v_humans<=3 or s.host_mode='bot' then
     s.moderator_player_id:=null;
+    v_moderator:=null;
+  elsif s.host_mode='random' then
+    select id,user_id into v_moderator_player,v_moderator from public.room_players
+    where room_id=p_room and not is_bot order by random() limit 1;
+    s.moderator_player_id:=v_moderator_player;
   else
     if s.host_mode<>'player' or s.moderator_player_id is null or not exists(select 1 from public.room_players where id=s.moderator_player_id and room_id=p_room and not is_bot) then return; end if;
     select user_id into v_moderator from public.room_players where id=s.moderator_player_id;
   end if;
-  if v_count-coalesce((select count(*) from public.room_players where id=s.moderator_player_id),0)<3 or
-    (select count(*) from public.room_players where room_id=p_room and not is_bot and id is distinct from s.moderator_player_id)<2 then return; end if;
+  select count(*),count(*) filter (where not is_bot) into v_active,v_active_humans
+  from public.room_players where room_id=p_room and id is distinct from s.moderator_player_id;
+  if v_active<3 or v_active_humans<2 then return; end if;
   select pair into v_pair from (values
     (array['кофе','чай']::text[]),(array['кинотеатр','театр']::text[]),(array['самолёт','вертолёт']::text[]),
     (array['пицца','пирог']::text[]),(array['море','бассейн']::text[]),(array['лифт','эскалатор']::text[]),
@@ -639,10 +637,11 @@ exception when duplicate_object then null; when undefined_object then null;
 end $$;
 
 grant execute on function public.is_room_member(uuid),public.is_room_owner(uuid) to authenticated;
-revoke all on function public.create_room(text,text),public.join_room(text,text,text),public.update_room_settings(uuid,integer,text,uuid,text,integer,integer),public.set_ready(uuid,boolean),public.kick_player(uuid,uuid),public.add_test_bot(uuid),public.update_room_profile(uuid,text,text),public.leave_room(uuid),public.room_heartbeat(uuid),public.expire_disconnected_players(uuid),public.consume_room_removal_notice(uuid) from public,anon;
+revoke all on function public.create_room(text,text),public.join_room(text,text,text),public.update_room_settings(uuid,integer,text,uuid,text,integer,integer),public.set_room_visibility(uuid,boolean),public.set_ready(uuid,boolean),public.kick_player(uuid,uuid),public.add_test_bot(uuid),public.update_room_profile(uuid,text,text),public.leave_room(uuid),public.room_heartbeat(uuid),public.expire_disconnected_players(uuid),public.consume_room_removal_notice(uuid) from public,anon;
 grant execute on function public.create_room(text,text) to authenticated;
 grant execute on function public.join_room(text,text,text) to authenticated;
 grant execute on function public.update_room_settings(uuid,integer,text,uuid,text,integer,integer) to authenticated;
+grant execute on function public.set_room_visibility(uuid,boolean) to authenticated;
 grant execute on function public.set_ready(uuid,boolean) to authenticated;
 grant execute on function public.kick_player(uuid,uuid) to authenticated;
 grant execute on function public.add_test_bot(uuid) to authenticated;
