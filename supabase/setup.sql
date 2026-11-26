@@ -118,7 +118,7 @@ create policy players_read on public.room_players for select to authenticated us
 drop policy if exists secrets_read on public.room_secrets;
 create policy secrets_read on public.room_secrets for select to authenticated using (
   exists(select 1 from public.room_players p where p.id=player_id and p.user_id=auth.uid())
-  or public.is_room_owner(room_id)
+
   or exists(select 1 from public.rooms r where r.id=room_id and r.moderator_uid=auth.uid())
   or (exists(select 1 from public.rooms r where r.id=room_id and r.status='finished') and public.is_room_member(room_id))
 );
